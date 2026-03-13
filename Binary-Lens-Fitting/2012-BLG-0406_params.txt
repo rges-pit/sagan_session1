@@ -1,0 +1,9 @@
+Parameter	Value	Error
+Tmax	2456141.413	0.023
+tau	64.649	0.052
+umin	0.525	0.0
+Amax	2.095	0.001
+Dmag	0.803	0.0
+fbl	1.0	0.0
+I_bl	16.35	0.0
+I0	16.35	0.0
