@@ -2,7 +2,7 @@
 Microlensing MCMC Analysis Module
 
 This module provides a class-based interface for performing MCMC analysis
-on microlensing models using the emcee package.
+on microlensing models using the emcee package and MulensModel.
 """
 
 import numpy as np
@@ -10,122 +10,43 @@ import emcee
 import corner
 import matplotlib.pyplot as plt
 from multiprocess import Pool
-from scipy.optimize import lsq_linear
-import VBMicrolensing as vbm
+import MulensModel as mm
 
 
 # ============================================================================
-# External Model Functions (can be overridden by user)
+# Log parameter handling
 # ============================================================================
 
-def get_mag(x0, p, t):
-    '''
-    Get the magnification curve for a given model and parameters.
-    
-    Parameters
-    ----------
-    x0: np.ndarray with initial parameters (t0, tE, u0, rho, s, q, alpha)
-    p: list[str] with parameter names
-    t: np.ndarray with data epochs
-    
-    Returns
-    -------
-    mag: np.ndarray with magnification curve
-    '''
-    # We will use the VBMicrolensing package to calculate magnifications for different source positions.
-    VBM = vbm.VBMicrolensing()
-     #create a dictionary of parameters
-    params = dict(zip(p, x0))
-    paramsc = params.copy()
-    tau = (t - paramsc['t0']) / paramsc['tE'] 
-    # Single lens model
-    if len(p) < 7 :
-        ul = np.sqrt(tau**2 + paramsc['u0']**2)
-        if 'logrho' in paramsc.keys():
-            paramsc['rho'] = 10**(paramsc['logrho'])
-        mag = np.array([VBM.ESPLMag2(u, paramsc['rho']) for u in ul])
-    # Binary lens model
-    elif len(p) >= 7:
-        salpha = np.sin(np.radians(paramsc['alpha']))
-        calpha = np.cos(np.radians(paramsc['alpha']))
-        xs = -paramsc['u0'] * salpha + tau * calpha 
-        ys = paramsc['u0'] * calpha + tau * salpha
-        if 'logs' in paramsc.keys():
-            paramsc['s'] = 10**(paramsc['logs'])
-        if 'logq' in paramsc.keys():
-            paramsc['q'] = 10**(paramsc['logq'])
-        if 'logrho' in paramsc.keys():
-            paramsc['rho'] = 10**(paramsc['logrho'])
-        mag = np.array([VBM.BinaryMag2(paramsc['s'], paramsc['q'], xs[i], ys[i], paramsc['rho']) for i in range(len(ys))])
-    return mag
+LOG_PARAM_MAP = {'log_t_E': 't_E', 'log_s': 's', 'log_q': 'q', 'log_rho': 'rho'}
 
 
-def calc_Fs(modelmag: np.ndarray, f: np.ndarray, sig2: np.ndarray) -> tuple[float, float]:
-    '''
-    Solves for the flux parameters for a given model using least squares.
-    
-    Parameters
-    ----------
-    model : np.ndarray
-        Model magnification curve.
-    f : np.ndarray
-        Observed flux values.
-    sig2 : np.ndarray
-        Flux errors.
-    
-    Returns
-    -------
-    FS : float
-        Source flux.
-    FB : float
-        Blend flux.
-    '''
-
+def chi2_mm(x0, params_to_fit, event):
     """
-    Solves for FS, FB by weighted least squares with FB >= 0 using lsq_linear.
-    """
-    modelmag = np.asarray(modelmag, float).ravel()
-    f = np.asarray(f, float).ravel()
-    sig2 = np.asarray(sig2, float).ravel()
-
-    w = 1.0 / np.sqrt(sig2)
-    A = np.column_stack([modelmag, np.ones_like(modelmag)])
-    Aw = A * w.reshape(-1, 1)
-    bw = f * w
-
-    res = lsq_linear(Aw, bw)
-    FS, FB = res.x
-    return float(FS), float(FB)
-
-
-def chi2(x0: np.ndarray, p: list, t: np.ndarray, f: np.ndarray, sig: np.ndarray) -> float:
-    '''
-    Calculates the chi squared value for a given model and parameters.
+    Calculates chi-squared by updating the MulensModel Event with the given parameters.
     
     Parameters
     ----------
-    x0 : np.ndarray
-        Initial parameters.
-    p : List[str]
-        List of parameter names.
-    t : np.ndarray
-        Data epochs.
-    f : np.ndarray
-        Observed flux values.
-    sig : np.ndarray
-        Flux errors.
-    
+    x0 : array-like
+        Parameter values (in the order of params_to_fit)
+    params_to_fit : list[str]
+        Parameter names. Use 'log_' prefix for t_E, s, q, rho to fit in log space.
+    event : mm.Event
+        MulensModel Event object
+        
     Returns
     -------
-    chi2 : float
-        Chi squared value.
-   '''
-    mag = get_mag(x0, p, t)
-    FS, FB = calc_Fs(mag, f, sig**2)
-    model = FS * mag + FB
+    float
+        Chi-squared value
+    """
+    for i, param_name in enumerate(params_to_fit):
+        if param_name in LOG_PARAM_MAP:
+            actual_param = LOG_PARAM_MAP[param_name]
+            setattr(event.model.parameters, actual_param, 10**x0[i])
+        else:
+            setattr(event.model.parameters, param_name, x0[i])
     
-    chi2_value = np.sum((f - model)**2 / sig**2)
-    return chi2_value
+    event.fit_fluxes()
+    return event.get_chi2()
 
 
 # ============================================================================
@@ -134,7 +55,7 @@ def chi2(x0: np.ndarray, p: list, t: np.ndarray, f: np.ndarray, sig: np.ndarray)
 
 class micro_mc:
     """
-    A class for performing MCMC analysis on microlensing models.
+    A class for performing MCMC analysis on microlensing models using MulensModel.
     
     This class encapsulates all functionality needed to fit microlensing
     light curves using MCMC methods, including convergence diagnostics
@@ -142,26 +63,16 @@ class micro_mc:
     
     Parameters
     ----------
-    df : pandas.DataFrame
-        Dataframe with data epochs, flux, and flux errors.
-        Expected columns: 'HJD-2450000', 'I_band_flux', 'I_band_flux_err'
-    x0 : np.ndarray
-        Initial parameter values
-    param_names : list[str]
-        List of parameter names
+    event : mm.Event
+        MulensModel Event object with model and datasets already set.
+    params_to_fit : list[str]
+        Parameter names to fit. Use 'log_' prefix (log_t_E, log_s, log_q, log_rho)
+        to fit in log space. Parameters NOT in this list are held fixed.
     log_probability : callable
         User-provided log probability function with signature:
-        log_probability(x, p, t, f, sig, bounds) -> float
+        log_probability(x, params_to_fit, event, bounds) -> float
     bounds : dict | None, optional
         Optional map of parameter name -> (min, max). If None, use defaults.
-    fixed_params : dict | None, optional
-        Parameters to freeze as {name: value}. Only other parameters are sampled.
-    get_mag_func : callable | None, optional
-        Custom magnification function. If None, uses default get_mag.
-    calc_Fs_func : callable | None, optional
-        Custom flux calculation function. If None, uses default calc_Fs.
-    chi2_func : callable | None, optional
-        Custom chi-squared function. If None, uses default chi2.
     
     Attributes
     ----------
@@ -169,58 +80,57 @@ class micro_mc:
         Dictionary containing MCMC analysis results (set after running perform_mcmc_analysis)
     """
     
-    def __init__(self, df, x0, param_names, log_probability, 
-                 bounds=None, fixed_params=None,
-                 get_mag_func=None, calc_Fs_func=None, chi2_func=None):
-        """Initialize the micro_mc analysis class.
+    def __init__(self, event, params_to_fit, log_probability, bounds=None):
+        """
+        Initialize the micro_mc analysis class.
         
-    Parameters
-    ----------
-    df : pandas.DataFrame
-        Dataframe with data epochs, flux, and flux errors.
-        Expected columns: 'HJD-2450000', 'I_band_flux', 'I_band_flux_err'
-    x0 : np.ndarray
-        Initial parameter values
-    param_names : list[str]
-        List of parameter names
-    log_probability : callable
-        User-provided log probability function with signature:
-        log_probability(x, p, t, f, sig, bounds) -> float
-    bounds : dict | None, optional
-        Optional map of parameter name -> (min, max). If None, use defaults.
-    fixed_params : dict | None, optional
-        Parameters to freeze as {name: value}. Only other parameters are sampled.
-    get_mag_func : callable | None, optional
-        Custom magnification function. If None, uses default get_mag.
-    calc_Fs_func : callable | None, optional
-        Custom flux calculation function. If None, uses default calc_Fs.
-    chi2_func : callable | None, optional
-        Custom chi-squared function. If None, uses default chi2.
-    
-    Attributes
-    ----------
-    results : dict
-        Dictionary containing MCMC analysis results (set after running perform_mcmc_analysis)
-    """
-        self.df = df
-        self.x0 = x0
-        self.param_names = param_names
+        Parameters
+        ----------
+        event : mm.Event
+            MulensModel Event object with model and datasets already set.
+        params_to_fit : list[str]
+            Parameter names to fit. Use 'log_' prefix for t_E, s, q, rho.
+        log_probability : callable
+            User-provided log probability function with signature:
+            log_probability(x, params_to_fit, event, bounds) -> float
+        bounds : dict | None, optional
+            Optional map of parameter name -> (min, max). If None, use defaults.
+        """
+        self.event = event
+        self.params_to_fit = params_to_fit
         self.log_probability = log_probability
         self.bounds = bounds
-        self.fixed_params = fixed_params
-        
-        # Store function references (use defaults if not provided)
-        self._get_mag_func = get_mag_func if get_mag_func is not None else get_mag
-        self._calc_Fs_func = calc_Fs_func if calc_Fs_func is not None else calc_Fs
-        self._chi2_func = chi2_func if chi2_func is not None else chi2
         
         # Results will be stored here after running analysis
         self.results = None
     
+    def _get_initial_values(self):
+        """Extract initial parameter values from the event model."""
+        x0 = []
+        for param_name in self.params_to_fit:
+            if param_name in LOG_PARAM_MAP:
+                actual_param = LOG_PARAM_MAP[param_name]
+                val = getattr(self.event.model.parameters, actual_param)
+                x0.append(np.log10(val))
+            else:
+                x0.append(getattr(self.event.model.parameters, param_name))
+        return np.array(x0)
+    
+    def _convert_to_linear(self, x0):
+        """Convert log parameters back to linear space."""
+        result = {}
+        for i, param_name in enumerate(self.params_to_fit):
+            if param_name in LOG_PARAM_MAP:
+                actual_param = LOG_PARAM_MAP[param_name]
+                result[actual_param] = 10**x0[i]
+            else:
+                result[param_name] = x0[i]
+        return result
+    
     def run_mcmc(self, steps=500, walkers=100, step_scale=1e-4, 
                  param_scales=None, verbose=False, pool=None):
         """
-        Fit an "event" with "parameters_to_fit" as free parameters.
+        Run MCMC sampling on the parameters specified in params_to_fit.
         
         Parameters
         ----------
@@ -231,99 +141,91 @@ class micro_mc:
         step_scale : float, optional
             Global step size scaling factor (default: 1e-4)
         param_scales : dict[str, float] | np.ndarray | None, optional
-            Either dict of per-parameter step sizes or array in p-order.
+            Dict of per-parameter step sizes or array matching params_to_fit order.
         verbose : bool, optional
             Print step size information (default: False)
         pool : multiprocessing.Pool | None, optional
-            Multiprocessing pool for parallel evaluation of log probability across walkers.
-            If None, runs in serial mode. (default: None)
+            Multiprocessing pool for parallel evaluation. If None, runs in serial.
         
         Returns
         -------
-        sampler, pos, prob, state, free_param_names
-            MCMC sampler results
+        sampler : emcee.EnsembleSampler
+            The MCMC sampler
+        pos : np.ndarray
+            Final walker positions
+        prob : np.ndarray
+            Final log probabilities
+        state : object
+            Random state
         """
-        # Take the initial starting point from the event.
-        t = np.array(self.df['HJD-2450000'])
-        f = np.array(self.df['I_band_flux'])
-        sig = np.array(self.df['I_band_flux_err'])
+        t = self.event.datasets[0].time
+        ndim = len(self.params_to_fit)
+        
+        if ndim == 0:
+            raise ValueError("No parameters to sample. Provide at least one parameter in params_to_fit.")
 
-        # Default bounds for clipping initial positions
+        # Default bounds (in fitting space)
         default_bounds = {
-            't0': (t.min(), t.max()),
-            'tE': (0.1, t.max() - t.min()),
-            'u0': (-10.0, 10.0),
+            't_0': (t.min(), t.max()),
+            't_E': (0.1, t.max() - t.min()),
+            'u_0': (-10.0, 10.0),
             'rho': (1e-5, 1.0),
             's': (1e-2, 20.0),
             'q': (1e-7, 1.0),
             'alpha': (0.0, 360.0),
-            'logs': (-2, 2),
-            'logq': (-7, 0),
-            'logrho': (-5, 0),
+            'log_t_E': (-1, 3),
+            'log_s': (-2, 2),
+            'log_q': (-7, 0),
+            'log_rho': (-5, 0),
         }
         bounds_map = default_bounds.copy()
         if self.bounds is not None:
-            bounds_map.update({k: tuple(v) for k, v in self.bounds.items() if k in bounds_map})
+            bounds_map.update(self.bounds)
 
-        fixed_params = self.fixed_params or {}
-        fixed_params = {k: float(v) for k, v in fixed_params.items()}
+        # Get initial values from event model
+        x0 = self._get_initial_values()
 
-        # free/fixed split
-        free_param_names = [name for name in self.param_names if name not in fixed_params]
-        ndim = len(free_param_names)
-        if ndim == 0:
-            raise ValueError("No free parameters to sample. Provide some free parameters or omit fixed_params.")
-
-        # Build x0 map and free starting positions
-        x0_map = dict(zip(self.param_names, self.x0))
-        x0_free = np.array([x0_map[name] for name in free_param_names])
-
-        # Step sizes dict -> array for free params
+        # Step sizes
         if isinstance(param_scales, dict):
-            scales_free = np.array([param_scales.get(name, step_scale) for name in free_param_names])
+            scales = np.array([param_scales.get(name, step_scale) for name in self.params_to_fit])
             if verbose:
-                print("Using dict step sizes for free parameters:")
-                for name, sc in zip(free_param_names, scales_free):
+                print("Using dict step sizes:")
+                for name, sc in zip(self.params_to_fit, scales):
                     print(f"  {name}: {sc:.2e}")
         elif isinstance(param_scales, np.ndarray):
-            if len(param_scales) != len(self.param_names):
-                raise ValueError(f"param_scales array must match param_names length ({len(self.param_names)}).")
-            name_to_scale = dict(zip(self.param_names, param_scales))
-            scales_free = np.array([name_to_scale[name] for name in free_param_names])
+            if len(param_scales) != ndim:
+                raise ValueError(f"param_scales array must match params_to_fit length ({ndim}).")
+            scales = param_scales
             if verbose:
-                print("Using array step sizes mapped to free parameters:")
-                for name, sc in zip(free_param_names, scales_free):
+                print("Using array step sizes:")
+                for name, sc in zip(self.params_to_fit, scales):
                     print(f"  {name}: {sc:.2e}")
         elif param_scales is None:
-            scales_free = np.array([step_scale] * ndim)
+            scales = np.array([step_scale] * ndim)
             if verbose:
                 print(f"Using global step size: {step_scale:.2e}")
         else:
             raise ValueError("param_scales must be a dict, numpy array, or None")
 
-        # Create initial starting points for all walkers in free space
+        # Create initial walker positions
         nwalkers = walkers
-        p0state_free = x0_free + scales_free * np.random.randn(nwalkers, ndim)
+        p0 = x0 + scales * np.random.randn(nwalkers, ndim)
 
-        # Clip initial positions to within bounds for free params
-        for j, name in enumerate(free_param_names):
+        # Clip to bounds
+        for j, name in enumerate(self.params_to_fit):
             lower, upper = bounds_map.get(name, (-np.inf, np.inf))
-            p0state_free[:, j] = np.clip(p0state_free[:, j], lower, upper)
+            p0[:, j] = np.clip(p0[:, j], lower, upper)
 
-        # Log prob wrapper that reconstructs full vector
-        def log_prob_free(theta_free: np.ndarray) -> float:
-            full_map = {**x0_map, **fixed_params}
-            for j, name in enumerate(free_param_names):
-                full_map[name] = float(theta_free[j])
-            x_full = np.array([full_map[name] for name in self.param_names])
-            return self.log_probability(x_full, self.param_names, t, f, sig, self.bounds)
+        # Log probability wrapper
+        def log_prob_wrapper(theta):
+            return self.log_probability(theta, self.params_to_fit, self.event, self.bounds)
 
-        sampler = emcee.EnsembleSampler(nwalkers, ndim, log_prob_free, pool=pool)
+        sampler = emcee.EnsembleSampler(nwalkers, ndim, log_prob_wrapper, pool=pool)
 
         # Run MCMC
-        pos, prob, state = sampler.run_mcmc(p0state_free, steps, progress=True)
+        pos, prob, state = sampler.run_mcmc(p0, steps, progress=True)
 
-        return sampler, pos, prob, state, free_param_names
+        return sampler, pos, prob, state
 
     @staticmethod
     def gelman_rubin_statistic(chains):
@@ -386,7 +288,7 @@ class micro_mc:
         samples : np.ndarray, optional
             MCMC samples. If None, uses self.results['samples']
         param_names : list, optional
-            Parameter names. If None, uses self.results['free_param_names']
+            Parameter names. If None, uses self.results['params_to_fit']
         title : str, optional
             Plot title
         show_titles : bool, optional
@@ -403,7 +305,7 @@ class micro_mc:
             if self.results is None:
                 raise ValueError("No results available. Run perform_mcmc_analysis first.")
             samples = self.results['samples']
-            param_names = self.results['free_param_names']
+            param_names = self.params_to_fit
         
         fig = corner.corner(samples, labels=param_names, 
                            quantiles=[0.16, 0.5, 0.84],
@@ -415,16 +317,12 @@ class micro_mc:
         plt.show()
         return fig
 
-    def plot_mcmc_fit(self, mle_params=None, param_names=None, mle_delta_chi2=None):
+    def plot_mcmc_fit(self, mle_delta_chi2=None):
         """
-        Plot the best fit model from MCMC
+        Plot the best fit model from MCMC using MulensModel Event.
         
         Parameters
         ----------
-        mle_params : np.ndarray, optional
-            MLE parameter values. If None, uses self.results['mle_params']
-        param_names : list, optional
-            Parameter names. If None, uses self.param_names
         mle_delta_chi2 : float, optional
             Delta chi-squared value. If None, uses self.results['mle_delta_chi2']
         
@@ -433,27 +331,32 @@ class micro_mc:
         fig : matplotlib.figure.Figure
             The fit plot figure
         """
-        if mle_params is None:
+        if mle_delta_chi2 is None:
             if self.results is None:
                 raise ValueError("No results available. Run perform_mcmc_analysis first.")
-            mle_params = self.results['mle_params']
-            param_names = self.param_names
             mle_delta_chi2 = self.results['mle_delta_chi2']
         
-        mle_modelmag = self._get_mag_func(mle_params, param_names, np.array(self.df['HJD-2450000']))
-        source_flux, blend_flux = self._calc_Fs_func(mle_modelmag, np.array(self.df['I_band_flux']), np.array(self.df['I_band_flux_err'])**2)
-        mle_model = source_flux * mle_modelmag + blend_flux
+        # Get data from event
+        data = self.event.datasets[0]
+        t = data.time
+        f = data.flux
+        sig = data.err_flux
+        
+        # Get model flux from event (MLE params should already be set)
+        self.event.fit_fluxes()
+        fs, fb = self.event.get_ref_fluxes()
+        model_mag = self.event.model.get_magnification(t)
+        model_flux = fs * model_mag + fb
         
         fig, ax = plt.subplots(figsize=(10, 6))
-        plt.errorbar(np.array(self.df['HJD-2450000']), np.array(self.df['I_band_flux']), yerr=np.array(self.df['I_band_flux_err']), 
-                     fmt='o', color='black', label='Data', markersize=2, alpha=0.7)
-        plt.plot(np.array(self.df['HJD-2450000']), mle_model, color='red', linewidth=2, 
-                 label=f'MCMC Best Fit - $\\Delta \\chi^2 = {mle_delta_chi2:.2f}$')
-        plt.xlabel('HJD - 2450000', fontsize=12)
-        plt.ylabel('Flux', fontsize=12)
-        plt.title('Binary Lens Model - MCMC Fit', fontsize=14)
-        plt.legend(loc='upper left', framealpha=0.8)
-        plt.grid(True, alpha=0.3)
+        ax.errorbar(t, f, yerr=sig, fmt='o', color='black', label='Data', markersize=2, alpha=0.7)
+        ax.plot(t, model_flux, color='red', linewidth=2, 
+                label=f'MCMC Best Fit - $\\Delta \\chi^2 = {mle_delta_chi2:.2f}$')
+        ax.set_xlabel('Time (HJD)', fontsize=12)
+        ax.set_ylabel('Flux', fontsize=12)
+        ax.set_title('Microlensing Model - MCMC Fit', fontsize=14)
+        ax.legend(loc='upper left', framealpha=0.8)
+        ax.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.show()
         return fig
@@ -575,7 +478,7 @@ class micro_mc:
                              verbose=False, plot_corner=False, show_titles=True, plot_fit=False, 
                              plot_traces=False, plot_convergence=False, n_threads=None, **kwargs):
         """
-        Perform complete MCMC analysis of binary lens model
+        Perform complete MCMC analysis of microlensing model.
         
         Parameters
         ----------
@@ -586,7 +489,7 @@ class micro_mc:
         step_scale : float, optional
             Global step size scaling factor (default: 1e-4)
         param_scales : dict[str, float] | np.ndarray | None, optional
-            Dict step sizes by param name (preferred) or array in p-order.
+            Dict step sizes by param name (preferred) or array in params_to_fit order.
         verbose : bool, optional
             If True, print detailed diagnostics (default: False)
         plot_corner : bool, optional
@@ -599,19 +502,19 @@ class micro_mc:
             If True, show convergence diagnostics (default: False)
         n_threads : int | None, optional
             Number of parallel threads to use for MCMC. If None, runs in serial mode.
-            Uses Python's multiprocessing Pool to parallelize log probability evaluations
-            across walkers. (default: None)
         
         Returns
         -------
         results : dict
             Dictionary containing sampler, samples, MLE parameters, statistics, etc.
-            Also stored in self.results
         """
+        ndim = len(self.params_to_fit)
+        n_data = len(self.event.datasets[0].flux)
         
         if verbose:
-            print("Running MCMC with binary lens model...")
-            print("Initial parameters:", dict(zip(self.param_names, self.x0)))
+            print("Running MCMC with microlensing model...")
+            x0 = self._get_initial_values()
+            print("Initial parameters:", dict(zip(self.params_to_fit, x0)))
         
         # Create multiprocessing pool if n_threads is specified
         pool = None
@@ -622,12 +525,11 @@ class micro_mc:
         
         try:
             # Run MCMC
-            sampler, pos, prob, state, free_param_names = self.run_mcmc(
+            sampler, pos, prob, state = self.run_mcmc(
                 steps=steps, walkers=walkers,
                 step_scale=step_scale, param_scales=param_scales, 
                 verbose=verbose, pool=pool)
         finally:
-            # Clean up pool
             if pool is not None:
                 pool.close()
                 pool.join()
@@ -666,7 +568,7 @@ class micro_mc:
         if verbose:
             print(f"Using burn-in period: {burn_in} steps ({burn_in/sampler.chain.shape[1]*100:.1f}% of chain)")
         
-        samples = sampler.chain[:, burn_in:, :].reshape((-1, len(free_param_names)))
+        samples = sampler.chain[:, burn_in:, :].reshape((-1, ndim))
         
         # Calculate convergence diagnostics
         post_burnin_chains = sampler.chain[:, burn_in:, :]
@@ -675,7 +577,7 @@ class micro_mc:
         
         if verbose:
             print(f"\nGelman-Rubin R-hat statistics (should be < 1.1 for convergence):")
-            for i, param in enumerate(free_param_names):
+            for i, param in enumerate(self.params_to_fit):
                 if not np.isnan(r_hat_values[i]):
                     status = "✓ Good" if r_hat_values[i] < 1.1 else "⚠ Poor" if r_hat_values[i] < 1.2 else "✗ Bad"
                     print(f"{param}: {r_hat_values[i]:.4f} ({status})")
@@ -683,45 +585,54 @@ class micro_mc:
                     print(f"{param}: Unable to calculate")
             
             print(f"\nEffective sample sizes:")
-            for i, param in enumerate(free_param_names):
+            for i, param in enumerate(self.params_to_fit):
                 print(f"{param}: {eff_sizes[i]:.0f} (out of {len(samples)} total samples)")
         
-        # Find MLE in free space and reconstruct full params
+        # Find MLE sample
         max_likelihood_idx = np.argmax(sampler.lnprobability[:, burn_in:].flatten())
-        mle_free = samples[max_likelihood_idx]
+        mle_sample = samples[max_likelihood_idx]
         
-        # Reconstruct full parameter vector from free samples
-        x0_map = dict(zip(self.param_names, self.x0))
-        fixed_params_map = self.fixed_params or {}
-        full_map = {**x0_map, **fixed_params_map}
-        for j, name in enumerate(free_param_names):
-            full_map[name] = float(mle_free[j])
-        mle_params = np.array([full_map[name] for name in self.param_names])
-        mle_dict = dict(zip(self.param_names, mle_params))
+        # Convert MLE to linear space and dict (fitted params only)
+        mle_linear = self._convert_to_linear(mle_sample)
         
-        # Calculate percentiles on free params only
+        # Also include values in fitting space
+        mle_fitting_space = dict(zip(self.params_to_fit, mle_sample))
+        
+        # Get ALL model parameters (fitted + frozen) from the event
+        all_model_params = dict(self.event.model.parameters.parameters)
+        # Update with fitted MLE values (in linear space)
+        all_model_params.update(mle_linear)
+        
+        # Calculate percentiles
         percentiles = np.percentile(samples, [16, 50, 84], axis=0)
-        medians_free = percentiles[1]
-        upper_errors_free = percentiles[2] - percentiles[1]
-        lower_errors_free = percentiles[1] - percentiles[0]
+        medians = percentiles[1]
+        upper_errors = percentiles[2] - percentiles[1]
+        lower_errors = percentiles[1] - percentiles[0]
         
-        # Calculate chi-squared for full MLE
-        mle_chi2 = self._chi2_func(mle_params, self.param_names, np.array(self.df['HJD-2450000']), 
-                                    np.array(self.df['I_band_flux']), np.array(self.df['I_band_flux_err']))
-        dof_params = len(free_param_names)
-        mle_delta_chi2 = mle_chi2 - (len(self.df) - dof_params)
+        # Set MLE parameters in event and calculate chi-squared
+        chi2_mm(mle_sample, self.params_to_fit, self.event)
+        mle_chi2 = self.event.get_chi2()
         
-        # Print basic results (always shown)
-        print("\nMaximum Likelihood Estimate (MLE) parameters (full):")
-        for param, value in mle_dict.items():
-            print(f"{param}: {value:.6f}")
+        # Degrees of freedom: n_data - n_params - 2 (for Fs, Fb)
+        dof = n_data - ndim - 2
+        mle_delta_chi2 = mle_chi2 - dof
         
-        print("\nMedian values with 1σ uncertainties (free params only):")
-        for i, param in enumerate(free_param_names):
-            print(f"{param}: {medians_free[i]:.6f} +{upper_errors_free[i]:.6f} -{lower_errors_free[i]:.6f}")
+        # Print basic results
+        print("\nMaximum Likelihood Estimate (MLE) parameters:")
+        print("  Fitted parameters (in fitting space):")
+        for param, value in mle_fitting_space.items():
+            print(f"    {param}: {value:.6f}")
+        print("  All model parameters (linear space, fitted + frozen):")
+        for param, value in all_model_params.items():
+            frozen_marker = "" if param in mle_linear else " [frozen]"
+            print(f"    {param}: {value:.6f}{frozen_marker}")
+        
+        print("\nMedian values with 1σ uncertainties (fitting space):")
+        for i, param in enumerate(self.params_to_fit):
+            print(f"  {param}: {medians[i]:.6f} +{upper_errors[i]:.6f} -{lower_errors[i]:.6f}")
         
         print(f"\nMLE Chi-squared: {mle_chi2:.2f}")
-        print(f"MLE Reduced chi-squared: {mle_chi2/(len(self.df)-dof_params):.2f}")
+        print(f"MLE Reduced chi-squared: {mle_chi2/dof:.2f}")
         print(f"MLE Delta chi-squared: {mle_delta_chi2:.2f}")
         
         # Assessment and recommendations
@@ -761,8 +672,6 @@ class micro_mc:
             print("⚠ POTENTIAL CONVERGENCE ISSUES:")
             for issue in convergence_issues:
                 print(f"  • {issue}")
-            
-        
             print("\n💡 RECOMMENDATIONS:")
             for rec in recommendations:
                 print(f"  {rec}")
@@ -784,28 +693,29 @@ class micro_mc:
         
         # Generate plots if requested
         if plot_corner:
-            self.plot_corner_mcmc(samples, free_param_names, show_titles=show_titles, **kwargs)
+            self.plot_corner_mcmc(samples, self.params_to_fit, show_titles=show_titles, **kwargs)
         
         if plot_fit:
-            self.plot_mcmc_fit(mle_params, self.param_names, mle_delta_chi2)
+            self.plot_mcmc_fit(mle_delta_chi2)
         
         if plot_traces:
-            self.plot_mcmc_traces(sampler, free_param_names, burn_in)
+            self.plot_mcmc_traces(sampler, self.params_to_fit, burn_in)
         
         if plot_convergence:
-            self.plot_convergence_diagnostics(sampler, free_param_names, burn_in)
+            self.plot_convergence_diagnostics(sampler, self.params_to_fit, burn_in)
         
         # Build results dictionary
         results = {
             'sampler': sampler,
-            'samples': samples,  # Free parameter samples only
-            'free_param_names': free_param_names,
-            'fixed_params': fixed_params_map,
-            'mle_params': mle_params,  # Full parameter vector
-            'mle_dict': mle_dict,  # Full parameter dict
-            'medians': medians_free,  # Free parameter medians
-            'upper_errors': upper_errors_free,  # Free parameter upper errors
-            'lower_errors': lower_errors_free,  # Free parameter lower errors
+            'samples': samples,
+            'params_to_fit': self.params_to_fit,
+            'mle_sample': mle_sample,
+            'mle_linear': mle_linear,
+            'mle_fitting_space': mle_fitting_space,
+            'all_model_params': all_model_params,  # fitted + frozen in linear space
+            'medians': medians,
+            'upper_errors': upper_errors,
+            'lower_errors': lower_errors,
             'mle_chi2': mle_chi2,
             'mle_delta_chi2': mle_delta_chi2,
             'burn_in': burn_in,
@@ -817,6 +727,5 @@ class micro_mc:
             'recommendations': recommendations
         }
         
-        # Store results as class attribute and return
         self.results = results
         return self.results
