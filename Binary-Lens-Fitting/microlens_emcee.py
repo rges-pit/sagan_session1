@@ -5,6 +5,9 @@ This module provides a class-based interface for performing MCMC analysis
 on microlensing models using the emcee package and MulensModel.
 """
 
+import json
+import os
+import warnings
 import numpy as np
 import emcee
 import corner
@@ -18,6 +21,56 @@ import MulensModel as mm
 # ============================================================================
 
 LOG_PARAM_MAP = {'log_t_E': 't_E', 'log_s': 's', 'log_q': 'q', 'log_rho': 'rho'}
+
+
+# ============================================================================
+# Per-worker state for multiprocessing (pool-initializer pattern)
+# ============================================================================
+
+_worker_state = {}
+
+
+def _init_worker(data_file, data_kwargs, model_params, mag_methods,
+                 log_prob_func, params_to_fit, bounds):
+    """
+    Pool initializer: creates a process-local MulensModel Event so that the
+    un-picklable VBMicrolensing C++ object is never sent between processes.
+
+    Parameters
+    ----------
+    data_file : str
+        Path to the data file for ``mm.MulensData``.
+    data_kwargs : dict
+        Extra keyword arguments for ``mm.MulensData`` (e.g. phot_fmt, chi2_fmt).
+    model_params : dict
+        Parameter dictionary for ``mm.Model``.
+    mag_methods : list
+        Arguments for ``model.set_magnification_methods()``.
+    log_prob_func : callable
+        Log-probability function with signature
+        ``(theta, params_to_fit, event, bounds) -> float``.
+    params_to_fit : list[str]
+        Parameter names being fitted.
+    bounds : dict | None
+        Bounds dictionary passed through to ``log_prob_func``.
+    """
+    data = mm.MulensData(file_name=data_file, **data_kwargs)
+    model = mm.Model(model_params, coords=None, ephemerides_file=None)
+    model.set_magnification_methods(mag_methods)
+    _worker_state['event'] = mm.Event(datasets=[data], model=model)
+    _worker_state['log_prob'] = log_prob_func
+    _worker_state['params_to_fit'] = params_to_fit
+    _worker_state['bounds'] = bounds
+
+
+def _log_prob_worker(theta):
+    """Log-probability evaluated inside a pool worker using process-local state."""
+    return _worker_state['log_prob'](
+        theta,
+        _worker_state['params_to_fit'],
+        _worker_state['event'],
+        _worker_state['bounds'],
+    )
 
 
 def chi2_mm(x0, params_to_fit, event):
@@ -216,11 +269,16 @@ class micro_mc:
             lower, upper = bounds_map.get(name, (-np.inf, np.inf))
             p0[:, j] = np.clip(p0[:, j], lower, upper)
 
-        # Log probability wrapper
-        def log_prob_wrapper(theta):
-            return self.log_probability(theta, self.params_to_fit, self.event, self.bounds)
+        # When a pool is provided, use the module-level _log_prob_worker which
+        # accesses a process-local Event (set up by _init_worker) so that the
+        # un-picklable VBMicrolensing object never crosses process boundaries.
+        if pool is not None:
+            log_prob_fn = _log_prob_worker
+        else:
+            def log_prob_fn(theta):
+                return self.log_probability(theta, self.params_to_fit, self.event, self.bounds)
 
-        sampler = emcee.EnsembleSampler(nwalkers, ndim, log_prob_wrapper, pool=pool)
+        sampler = emcee.EnsembleSampler(nwalkers, ndim, log_prob_fn, pool=pool)
 
         # Run MCMC
         pos, prob, state = sampler.run_mcmc(p0, steps, progress=True)
@@ -364,45 +422,84 @@ class micro_mc:
     @staticmethod
     def plot_mcmc_traces(sampler, param_names, burn_in):
         """
-        Plot MCMC trace plots for convergence diagnosis
-        
+        Plot MCMC trace plots for convergence diagnosis.
+
+        In addition to one row per fitted parameter, an extra bottom row shows
+        chi-squared (= -2 * log-probability) as a function of step for every
+        walker.  Requires ``sampler.lnprobability`` (shape
+        ``(n_walkers, n_steps)``) to be present; if it is missing the chi^2
+        row is omitted with a warning.
+
         Parameters
         ----------
-        sampler : emcee.EnsembleSampler
-            The MCMC sampler
+        sampler : emcee.EnsembleSampler or object with .chain (and optionally
+            .lnprobability)
+            The MCMC sampler (or a lightweight wrapper around saved arrays).
         param_names : list
             Parameter names
         burn_in : int
             Burn-in period
-        
+
         Returns
         -------
         fig : matplotlib.figure.Figure
             The trace plot figure
         """
-        fig, axes = plt.subplots(len(param_names), 1, figsize=(12, 2*len(param_names)), sharex=True)
-        if len(param_names) == 1:
+        has_lnprob = hasattr(sampler, 'lnprobability') and sampler.lnprobability is not None
+        if not has_lnprob:
+            warnings.warn(
+                "sampler has no 'lnprobability' attribute; skipping chi^2 trace row. "
+                "Re-run MCMC with the updated save_results to generate a "
+                "'<prefix>_lnprob.npy' file and pass it via "
+                "SimpleNamespace(chain=..., lnprobability=...).",
+                stacklevel=2,
+            )
+
+        n_rows = len(param_names) + (1 if has_lnprob else 0)
+        fig, axes = plt.subplots(n_rows, 1, figsize=(12, 2*n_rows), sharex=True)
+        if n_rows == 1:
             axes = [axes]
-        
+
+        n_walkers = sampler.chain.shape[0]
+        random_walkers = np.random.choice(
+            n_walkers, size=min(5, n_walkers), replace=False
+        )
+        colors = ['red', 'blue', 'green', 'orange', 'purple']
+
         for i in range(len(param_names)):
-            # Plot all walker chains
-            for j in range(sampler.chain.shape[0]):
+            for j in range(n_walkers):
                 axes[i].plot(sampler.chain[j, :, i], color='k', alpha=0.4, linewidth=0.5)
-            
-            # Highlight a few random walkers for clarity
-            random_walkers = np.random.choice(sampler.chain.shape[0], size=min(5, sampler.chain.shape[0]), replace=False)
-            colors = ['red', 'blue', 'green', 'orange', 'purple']
+
             for idx, walker in enumerate(random_walkers):
                 color = colors[idx % len(colors)]
-                axes[i].plot(sampler.chain[walker, :, i], color=color, alpha=0.7, linewidth=1.2, 
+                axes[i].plot(sampler.chain[walker, :, i], color=color, alpha=0.7, linewidth=1.2,
                             label=f'Walker {walker}' if i == 0 else '')
-            
+
             axes[i].axvline(burn_in, color='red', linestyle='--', linewidth=2, label='Burn-in' if i == 0 else '')
             axes[i].set_ylabel(f'{param_names[i]}', fontsize=12)
             axes[i].grid(True, alpha=0.3)
             if i == 0:
                 axes[i].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        
+
+        if has_lnprob:
+            ax_chi2 = axes[len(param_names)]
+            lnp = np.asarray(sampler.lnprobability)
+            # log_probability = log_prior + (-0.5 * chi^2), with log_prior = 0
+            # inside the bounds and -inf outside.  Mask out-of-bounds proposals.
+            chi2 = np.where(np.isfinite(lnp), -2.0 * lnp, np.nan)
+
+            for j in range(n_walkers):
+                ax_chi2.plot(chi2[j, :], color='k', alpha=0.4, linewidth=0.5)
+
+            for idx, walker in enumerate(random_walkers):
+                color = colors[idx % len(colors)]
+                ax_chi2.plot(chi2[walker, :], color=color, alpha=0.7, linewidth=1.2)
+
+            ax_chi2.axvline(burn_in, color='red', linestyle='--', linewidth=2)
+            ax_chi2.set_ylabel(r'$\chi^2$', fontsize=12)
+            ax_chi2.set_yscale('log')
+            ax_chi2.grid(True, alpha=0.3, which='both')
+
         axes[-1].set_xlabel('Step Number', fontsize=12)
         plt.suptitle('MCMC Trace Plots - Individual Walker Chains', fontsize=16)
         plt.tight_layout()
@@ -473,10 +570,100 @@ class micro_mc:
         plt.show()
         return fig
 
+    def save_results(self, filename_prefix='mcmc_results'):
+        """
+        Save MCMC chains, posterior samples, and metadata to disk.
+
+        Four files are written:
+
+        * ``<filename_prefix>_chains.npy``      – full walker chains,
+          shape ``(n_walkers, n_steps, n_params)``
+        * ``<filename_prefix>_posteriors.npy``  – flat posterior samples
+          after burn-in, shape ``(n_samples, n_params)``
+        * ``<filename_prefix>_lnprob.npy``      – per-walker / per-step
+          log-probability, shape ``(n_walkers, n_steps)``.  Needed for the
+          chi^2 row in :meth:`plot_mcmc_traces`.
+        * ``<filename_prefix>_metadata.json``   – parameter names, MLE
+          values, medians, uncertainties, and convergence statistics
+
+        Parameters
+        ----------
+        filename_prefix : str, optional
+            Path prefix (including directory) for the output files.
+            Defaults to ``'mcmc_results'`` (current directory).
+
+        Returns
+        -------
+        saved_files : list[str]
+            Absolute paths of the three files that were written.
+        """
+        if self.results is None:
+            raise ValueError("No results available. Run perform_mcmc_analysis first.")
+
+        sampler = self.results['sampler']
+        samples = self.results['samples']
+
+        chains_path = filename_prefix + '_chains.npy'
+        posteriors_path = filename_prefix + '_posteriors.npy'
+        lnprob_path = filename_prefix + '_lnprob.npy'
+        metadata_path = filename_prefix + '_metadata.json'
+
+        # Full chains: shape (n_walkers, n_steps, n_params)
+        np.save(chains_path, sampler.chain)
+
+        # Flat posterior samples after burn-in: shape (n_samples, n_params)
+        np.save(posteriors_path, samples)
+
+        # Per-walker / per-step log-probability: shape (n_walkers, n_steps)
+        np.save(lnprob_path, sampler.lnprobability)
+
+        # Metadata (JSON-serialisable scalars / lists only)
+        autocorr_times = self.results['autocorr_times']
+        metadata = {
+            'params_to_fit': self.results['params_to_fit'],
+            'burn_in': int(self.results['burn_in']),
+            'n_walkers': int(sampler.chain.shape[0]),
+            'n_steps': int(sampler.chain.shape[1]),
+            'n_params': int(sampler.chain.shape[2]),
+            'n_posterior_samples': int(samples.shape[0]),
+            'has_lnprob': True,
+            'mle_fitting_space': {k: float(v) for k, v in self.results['mle_fitting_space'].items()},
+            'mle_linear': {k: float(v) for k, v in self.results['mle_linear'].items()},
+            'all_model_params': {k: float(v) for k, v in self.results['all_model_params'].items()},
+            'medians': self.results['medians'].tolist(),
+            'upper_errors': self.results['upper_errors'].tolist(),
+            'lower_errors': self.results['lower_errors'].tolist(),
+            'mle_chi2': float(self.results['mle_chi2']),
+            'mle_delta_chi2': float(self.results['mle_delta_chi2']),
+            'mean_acceptance': float(self.results['mean_acceptance']),
+            'autocorr_times': autocorr_times.tolist() if autocorr_times is not None else None,
+            'r_hat_values': self.results['r_hat_values'].tolist(),
+            'eff_sizes': self.results['eff_sizes'].tolist(),
+            'convergence_issues': self.results['convergence_issues'],
+            'recommendations': self.results['recommendations'],
+        }
+
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        saved_files = [
+            os.path.abspath(chains_path),
+            os.path.abspath(posteriors_path),
+            os.path.abspath(lnprob_path),
+            os.path.abspath(metadata_path),
+        ]
+
+        print(f"MCMC results saved:")
+        for path in saved_files:
+            print(f"  {path}")
+
+        return saved_files
+
     def perform_mcmc_analysis(self, steps=3000, walkers=50, 
                              step_scale=1e-4, param_scales=None,
                              verbose=False, plot_corner=False, show_titles=True, plot_fit=False, 
-                             plot_traces=False, plot_convergence=False, n_threads=None, **kwargs):
+                             plot_traces=False, plot_convergence=False, n_threads=None,
+                             pool_init_data=None, save_chains=None, **kwargs):
         """
         Perform complete MCMC analysis of microlensing model.
         
@@ -501,8 +688,26 @@ class micro_mc:
         plot_convergence : bool, optional
             If True, show convergence diagnostics (default: False)
         n_threads : int | None, optional
-            Number of parallel threads to use for MCMC. If None, runs in serial mode.
-        
+            Number of parallel processes to use for MCMC.
+            If None, 0, or 1, runs in serial mode.
+        pool_init_data : dict | None, optional
+            Required when ``n_threads > 1``.  Supplies the information each
+            worker process needs to construct its own ``mm.Event`` (avoiding
+            pickling of the un-serialisable VBMicrolensing C++ object).
+            Keys:
+
+            * ``'data_file'`` (str) -- path to the data file
+            * ``'data_kwargs'`` (dict) -- extra kwargs for ``mm.MulensData``
+              (e.g. ``{'phot_fmt': 'mag', 'chi2_fmt': 'flux'}``)
+            * ``'model_params'`` (dict) -- parameter dict for ``mm.Model``
+            * ``'mag_methods'`` (list) -- args for
+              ``model.set_magnification_methods()``
+        save_chains : str | None, optional
+            If provided, save chains, posteriors, and metadata using this string as
+            the filename prefix (e.g. ``'results/binary_mcmc'``).
+            Calls :meth:`save_results` automatically after the run.
+            If None (default), nothing is saved.
+
         Returns
         -------
         results : dict
@@ -516,12 +721,34 @@ class micro_mc:
             x0 = self._get_initial_values()
             print("Initial parameters:", dict(zip(self.params_to_fit, x0)))
         
-        # Create multiprocessing pool if n_threads is specified
+        # Create multiprocessing pool only when n_threads > 1.
+        # Each worker creates its own mm.Event via _init_worker so that the
+        # un-picklable VBMicrolensing C++ object never crosses processes.
         pool = None
-        if n_threads is not None:
-            pool = Pool(processes=n_threads)
+        if n_threads is not None and n_threads > 1:
+            if pool_init_data is None:
+                raise ValueError(
+                    "pool_init_data is required when n_threads > 1 to avoid "
+                    "VBMicrolensing pickling errors.  Pass a dict with keys: "
+                    "'data_file', 'data_kwargs', 'model_params', 'mag_methods'."
+                )
+            pool = Pool(
+                processes=n_threads,
+                initializer=_init_worker,
+                initargs=(
+                    pool_init_data['data_file'],
+                    pool_init_data.get('data_kwargs', {}),
+                    pool_init_data['model_params'],
+                    pool_init_data['mag_methods'],
+                    self.log_probability,
+                    self.params_to_fit,
+                    self.bounds,
+                ),
+            )
             if verbose:
                 print(f"Using {n_threads} parallel processes for MCMC")
+        elif verbose and n_threads is not None:
+            print(f"Using serial mode (n_threads={n_threads})")
         
         try:
             # Run MCMC
@@ -691,20 +918,8 @@ class micro_mc:
         
         print("\n" + "="*60)
         
-        # Generate plots if requested
-        if plot_corner:
-            self.plot_corner_mcmc(samples, self.params_to_fit, show_titles=show_titles, **kwargs)
-        
-        if plot_fit:
-            self.plot_mcmc_fit(mle_delta_chi2)
-        
-        if plot_traces:
-            self.plot_mcmc_traces(sampler, self.params_to_fit, burn_in)
-        
-        if plot_convergence:
-            self.plot_convergence_diagnostics(sampler, self.params_to_fit, burn_in)
-        
-        # Build results dictionary
+        # Build results dictionary and save *before* plotting so that a
+        # plotting error can never discard a long MCMC run.
         results = {
             'sampler': sampler,
             'samples': samples,
@@ -728,4 +943,22 @@ class micro_mc:
         }
         
         self.results = results
+
+        if save_chains is not None:
+            os.makedirs(os.path.dirname(os.path.abspath(save_chains + '_chains.npy')), exist_ok=True)
+            self.save_results(filename_prefix=save_chains)
+
+        # Generate plots if requested
+        if plot_corner:
+            self.plot_corner_mcmc(samples, self.params_to_fit, show_titles=show_titles, **kwargs)
+        
+        if plot_fit:
+            self.plot_mcmc_fit(mle_delta_chi2)
+        
+        if plot_traces:
+            self.plot_mcmc_traces(sampler, self.params_to_fit, burn_in)
+        
+        if plot_convergence:
+            self.plot_convergence_diagnostics(sampler, self.params_to_fit, burn_in)
+
         return self.results
